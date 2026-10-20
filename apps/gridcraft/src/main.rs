@@ -229,6 +229,28 @@ fn icon() -> Option<egui::IconData> {
     Some(egui::IconData { width: img.width(), height: img.height(), rgba: img.into_raw() })
 }
 
+/// Whether to open the window on X11 (XWayland) rather than Wayland. GNOME's compositor draws no
+/// frames for Wayland clients, so there winit falls back to its own bare frame: a plain strip with
+/// square buttons and no title. Through XWayland, GNOME draws its own title bar, themed and with
+/// the user's button layout, as for WordCraft. Other desktops (KDE, Sway…) frame Wayland windows
+/// themselves and stay on Wayland; `GRIDCRAFT_WAYLAND=1` keeps GNOME on Wayland too.
+///
+/// winit builds one event loop per process, so a failed X11 start can't fall back to Wayland:
+/// X11 is only chosen when the local X server's socket is there (a Flatpak's `fallback-x11`
+/// hides it under Wayland).
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn prefer_x11(var: impl Fn(&str) -> Option<String>, exists: impl Fn(&std::path::Path) -> bool) -> bool {
+    let gnome = var("XDG_CURRENT_DESKTOP").is_some_and(|d| d.split(':').any(|d| d.eq_ignore_ascii_case("gnome")));
+    let wayland = var("WAYLAND_DISPLAY").is_some_and(|d| !d.is_empty());
+    let opt_out = var("GRIDCRAFT_WAYLAND").is_some_and(|v| !v.is_empty() && v != "0");
+    // `:0` or `:0.0` is the socket /tmp/.X11-unix/X0; remote displays aren't trusted to answer.
+    let socket = var("DISPLAY").and_then(|d| {
+        let n = d.strip_prefix(':')?.split('.').next()?.to_string();
+        (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| std::path::PathBuf::from(format!("/tmp/.X11-unix/X{n}")))
+    });
+    gnome && wayland && !opt_out && socket.is_some_and(|s| exists(&s))
+}
+
 fn main() -> eframe::Result<()> {
     // First, so the panic hook and every start-up warning are recorded (`logging`).
     let logger = logging::install();
@@ -321,6 +343,18 @@ fn main() -> eframe::Result<()> {
         viewport = viewport.with_icon(i);
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    let options = {
+        let mut options = options;
+        if prefer_x11(|k| std::env::var(k).ok(), |p| p.exists()) {
+            log::info!("GNOME on Wayland: using X11 so GNOME draws the title bar (GRIDCRAFT_WAYLAND=1 keeps Wayland)");
+            options.event_loop_builder = Some(Box::new(|builder| {
+                use winit::platform::x11::EventLoopBuilderExtX11 as _;
+                builder.with_x11();
+            }));
+        }
+        options
+    };
     // Before eframe creates the wgpu instance: Windows starts on DirectX 12, or OpenGL when
     // DirectX 12 has no GPU driver, and never touches Vulkan unless asked (see graphics.rs).
     #[cfg(target_os = "windows")]
@@ -382,6 +416,34 @@ fn main() -> eframe::Result<()> {
         return run(options);
     }
     result
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "freebsd")))]
+mod backend_tests {
+    use super::prefer_x11;
+
+    fn prefer(vars: &[(&str, &str)], socket: bool) -> bool {
+        prefer_x11(|k| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string()), |p| socket && p.to_str() == Some("/tmp/.X11-unix/X0"))
+    }
+
+    const GNOME_WAYLAND: &[(&str, &str)] = &[("XDG_CURRENT_DESKTOP", "ubuntu:GNOME"), ("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":0")];
+
+    /// GNOME on Wayland gets GNOME's title bar through XWayland; everything else keeps winit's
+    /// default backend, and no X server socket means no X11 (it couldn't fall back).
+    #[test]
+    fn x11_only_for_gnome_wayland_with_an_x_server() {
+        assert!(prefer(GNOME_WAYLAND, true));
+        assert!(prefer(&[("XDG_CURRENT_DESKTOP", "GNOME"), ("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":0.0")], true));
+        assert!(!prefer(GNOME_WAYLAND, false), "no X socket");
+        assert!(!prefer(&[("XDG_CURRENT_DESKTOP", "KDE"), ("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":0")], true));
+        assert!(!prefer(&[("XDG_CURRENT_DESKTOP", "GNOME"), ("DISPLAY", ":0")], true), "an X11 session already uses X11");
+        assert!(!prefer(&[("XDG_CURRENT_DESKTOP", "GNOME"), ("WAYLAND_DISPLAY", "wayland-0")], true), "no DISPLAY");
+        assert!(!prefer(&[("XDG_CURRENT_DESKTOP", "GNOME"), ("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", "host:0")], true));
+        let opt_out = [GNOME_WAYLAND, &[("GRIDCRAFT_WAYLAND", "1")]].concat();
+        assert!(!prefer(&opt_out, true));
+        let zero = [GNOME_WAYLAND, &[("GRIDCRAFT_WAYLAND", "0")]].concat();
+        assert!(prefer(&zero, true));
+    }
 }
 
 #[cfg(test)]
