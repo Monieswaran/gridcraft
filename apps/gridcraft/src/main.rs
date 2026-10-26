@@ -1,9 +1,10 @@
 //! GridCraft desktop app.
 //!
-//! Usage: `gridcraft [--control <port>] [--sample <name>] [files…]`
+//! Usage: `gridcraft [--control <port> [--control-token <token>]] [--sample <name>] [files…]`
 //!
 //! `--control <port>` (or `GRIDCRAFT_CONTROL_PORT`) starts a localhost JSON-lines control
 //! server: `{"id":1,"method":"ui.inspect","params":{}}` → `{"id":1,"ok":true,"result":…}`.
+//! The first line of each connection must carry the token (`docs/control-protocol.md`).
 //! See `gridcraft_ui_egui::control` and `docs/control-protocol.md` for the methods.
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
@@ -22,31 +23,34 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use gridcraft_engine::Session;
+use gridcraft_ui_egui::doc_windows::DocWindows;
 use gridcraft_ui_egui::{Services, SheetApp};
 use serde_json::json;
 
-struct App(SheetApp, #[cfg(target_os = "macos")] Option<native_menu::NativeMenu>, #[cfg(target_os = "macos")] fmv_macos_events::Inbox);
+/// The app, its native window per workbook window, and (macOS) the menu bar and Finder events.
+struct App(SheetApp, DocWindows, #[cfg(target_os = "macos")] Option<native_menu::NativeMenu>, #[cfg(target_os = "macos")] fmv_macos_events::Inbox);
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         #[cfg(target_os = "macos")]
         {
-            if self.1.is_none() && std::env::var_os("GRIDCRAFT_NO_NATIVE_MENU").is_none() {
-                self.1 = Some(native_menu::NativeMenu::install(ctx));
+            if self.2.is_none() && std::env::var_os("GRIDCRAFT_NO_NATIVE_MENU").is_none() {
+                self.2 = Some(native_menu::NativeMenu::install(ctx));
             }
-            if let Some(m) = &self.1 {
-                m.poll(&mut self.0, ctx);
+            if let Some(m) = &mut self.2 {
+                m.poll(&mut self.0, ctx, self.1.focused_viewport());
             }
-            apple_events::poll(&self.2, &mut self.0, ctx);
+            apple_events::poll(&self.3, &mut self.0, ctx);
         }
         self.0.logic(ctx);
-        self.0.poll_printing(ctx);
+        self.1.logic(&mut self.0, ctx);
         if ctx.input(|input| input.viewport().close_requested()) && self.0.printing.busy() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
     }
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
-        self.0.raw_input_hook(raw);
+    /// Forwards raw input to the shared app, then opens every non-empty dropped file path as a workbook.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        self.0.raw_input_hook(ctx, raw);
         // Files dropped on the window open as workbooks.
         for f in std::mem::take(&mut raw.dropped_files) {
             if let Some(p) = f.path().to_str().map(str::to_string).filter(|p| !p.is_empty()) {
@@ -55,7 +59,7 @@ impl eframe::App for App {
         }
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.0.ui(ui);
+        self.1.show(&mut self.0, ui);
     }
     fn on_exit(&mut self) {
         print::finish_pending_jobs();
@@ -111,7 +115,7 @@ fn load_prefs(app: &mut SheetApp) {
     {
         let saved = serde_json::from_slice(&b).ok().and_then(|v| gridcraft_ui_egui::i18n::saved_language(&v));
         let language = saved.unwrap_or(app.ui.language);
-        app.ui = ui;
+        app.ui = ui.at_startup();
         app.ui.language = language;
     }
     if let Ok(b) = std::fs::read(dir.join("prefs.json"))
@@ -180,11 +184,11 @@ fn services() -> Services {
         })),
         pick_save: Some(Box::new(|suggested: &str| {
             let path = std::path::Path::new(suggested);
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Book1").to_string();
+            let stem = path.file_stem().and_then(std::ffi::OsStr::to_str).unwrap_or("Book1").to_string();
             // The suggested name's type (an export asks for .pdf, .csv or .html) comes first.
             const TYPES: [(&str, &str); 4] =
                 [("Excel Workbook (.xlsx)", "xlsx"), ("CSV UTF-8 (.csv)", "csv"), ("Web Page (.html)", "html"), ("PDF (.pdf)", "pdf")];
-            let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).filter(|e| TYPES.iter().any(|(_, x)| x == e));
+            let ext = path.extension().and_then(std::ffi::OsStr::to_str).map(str::to_ascii_lowercase).filter(|e| TYPES.iter().any(|(_, x)| x == e));
             let ext = ext.unwrap_or_else(|| "xlsx".to_string());
             let mut dialog = rfd::FileDialog::new().set_file_name(format!("{stem}.{ext}"));
             for (label, x) in TYPES.iter().filter(|(_, x)| *x == ext).chain(TYPES.iter().filter(|(_, x)| *x != ext)) {
@@ -229,18 +233,18 @@ fn icon() -> Option<egui::IconData> {
     Some(egui::IconData { width: img.width(), height: img.height(), rgba: img.into_raw() })
 }
 
-/// Whether to open the window on X11 (XWayland) rather than Wayland. GNOME's compositor draws no
-/// frames for Wayland clients, so there winit falls back to its own bare frame: a plain strip with
-/// square buttons and no title. Through XWayland, GNOME draws its own title bar, themed and with
-/// the user's button layout, as for WordCraft. Other desktops (KDE, Sway…) frame Wayland windows
-/// themselves and stay on Wayland; `GRIDCRAFT_WAYLAND=1` keeps GNOME on Wayland too.
+/// Whether to open the window on X11 (XWayland) rather than Wayland. winit has no file
+/// drag-and-drop on Wayland (only on X11), so dropping files from the file manager showed a "no"
+/// cursor. And GNOME's compositor draws no frames for Wayland clients, so there winit falls back to
+/// its own bare frame: a plain strip with square buttons and no title; through XWayland, GNOME
+/// draws its own title bar, themed and with the user's button layout. `GRIDCRAFT_WAYLAND=1` keeps
+/// the native Wayland backend.
 ///
 /// winit builds one event loop per process, so a failed X11 start can't fall back to Wayland:
 /// X11 is only chosen when `usable` (`x11_usable`) confirms that it will start on the local
-/// display. It is only asked on GNOME Wayland, without the opt-out.
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+/// display. It is only asked on Wayland, without the opt-out.
+#[cfg(all(unix, not(target_os = "macos")))]
 fn prefer_x11(var: impl Fn(&str) -> Option<String>, usable: impl FnOnce(&str) -> bool) -> bool {
-    let gnome = var("XDG_CURRENT_DESKTOP").is_some_and(|d| d.split(':').any(|d| d.eq_ignore_ascii_case("gnome")));
     let wayland = var("WAYLAND_DISPLAY").is_some_and(|d| !d.is_empty());
     let opt_out = var("GRIDCRAFT_WAYLAND").is_some_and(|v| !v.is_empty() && v != "0");
     // Only a local display (`:0`, `:0.0`), the session's XWayland; remote displays aren't tried.
@@ -250,14 +254,14 @@ fn prefer_x11(var: impl Fn(&str) -> Option<String>, usable: impl FnOnce(&str) ->
         let n = d.strip_prefix(':').and_then(|s| s.split('.').next()).unwrap_or_default();
         n.bytes().all(|b| b.is_ascii_digit()) && n.parse::<u16>().is_ok_and(|n| n <= 59535)
     });
-    gnome && wayland && !opt_out && local.is_some_and(|d| usable(&d))
+    wayland && !opt_out && local.is_some_and(|d| usable(&d))
 }
 
 /// Whether winit's X11 backend will start on `display`: the libraries it loads are there (without
 /// them it fails, or panics for libxkbcommon-x11), and the server accepts a connection, its
 /// authorization included. A socket that exists proves neither. The probe connection is closed
 /// before returning.
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn x11_usable(display: &str) -> bool {
     use x11_dl::{xcursor::Xcursor, xinput2::XInput2, xlib::Xlib, xlib_xcb::Xlib_xcb};
     let libs = Xlib::open().is_ok()
@@ -303,11 +307,20 @@ fn main() -> eframe::Result<()> {
         }
     }));
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // The restart helper a self-update spawns: it finishes the swap and relaunches, then exits.
+    if let Some(done) = craft_update::self_update::finish(&craft_update::suite::GRIDCRAFT, &std::env::args_os().skip(1).collect::<Vec<_>>()) {
+        if let Err(e) = done {
+            eprintln!("GridCraft update helper failed: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("GridCraft {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     let mut control_port: Option<u16> = std::env::var("GRIDCRAFT_CONTROL_PORT").ok().and_then(|p| p.parse().ok());
+    let mut control_token: Option<String> = std::env::var("GRIDCRAFT_CONTROL_TOKEN").ok();
     let mut sample: Option<String> = None;
     let mut files: Vec<String> = Vec::new();
     let mut i = 0;
@@ -316,6 +329,10 @@ fn main() -> eframe::Result<()> {
             "--control" => {
                 i += 1;
                 control_port = args.get(i).and_then(|p| p.parse().ok());
+            }
+            "--control-token" => {
+                i += 1;
+                control_token = args.get(i).cloned();
             }
             "--sample" => {
                 i += 1;
@@ -351,6 +368,7 @@ fn main() -> eframe::Result<()> {
     }
     let mut app = SheetApp::new(session, services());
     app.watch_desktop_theme();
+    app.start_update_check();
     app.after_engine(); // Show warnings from the sample.
     let control_port = control_port;
     load_prefs(&mut app);
@@ -372,12 +390,13 @@ fn main() -> eframe::Result<()> {
     if let Some(i) = icon() {
         viewport = viewport.with_icon(i);
     }
+    let window_builder = viewport.clone();
     let options = eframe::NativeOptions { viewport, ..Default::default() };
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(all(unix, not(target_os = "macos")))]
     let options = {
         let mut options = options;
         if prefer_x11(|k| std::env::var(k).ok(), x11_usable) {
-            log::info!("GNOME on Wayland: using X11 so GNOME draws the title bar (GRIDCRAFT_WAYLAND=1 keeps Wayland)");
+            log::info!("Wayland: using X11 (XWayland) for file drag-and-drop and the desktop's title bar (GRIDCRAFT_WAYLAND=1 keeps Wayland)");
             options.event_loop_builder = Some(Box::new(|builder| {
                 use winit::platform::x11::EventLoopBuilderExtX11 as _;
                 builder.with_x11();
@@ -416,13 +435,15 @@ fn main() -> eframe::Result<()> {
                 };
                 SheetApp::setup_context_for_language(&cc.egui_ctx, app.ui.dark, app.ui.language);
                 if let Some(port) = control_port {
-                    match control_server::start(port, cc.egui_ctx.clone()) {
+                    match control_server::start(port, control_token.clone(), cc.egui_ctx.clone()) {
                         Ok(rx) => app.control_rx = Some(rx),
                         Err(e) => log::error!("control channel on port {port}: {e}"),
                     }
                 }
+                let windows = DocWindows::new(&mut app, window_builder.clone(), DocWindows::platform_quits_with_last_window());
                 Ok(Box::new(App(
                     app,
+                    windows,
                     #[cfg(target_os = "macos")]
                     None,
                     #[cfg(target_os = "macos")]
@@ -448,7 +469,7 @@ fn main() -> eframe::Result<()> {
     result
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "freebsd")))]
+#[cfg(all(test, unix, not(target_os = "macos")))]
 mod backend_tests {
     use std::cell::Cell;
 
@@ -470,10 +491,13 @@ mod backend_tests {
 
     const GNOME_WAYLAND: &[(&str, &str)] = &[("XDG_CURRENT_DESKTOP", "ubuntu:GNOME"), ("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":0")];
 
-    /// GNOME on Wayland gets GNOME's title bar through XWayland when X11 will start there.
+    /// Wayland sessions go through XWayland when X11 will start there: file drag-and-drop on
+    /// every desktop, and GNOME's own title bar on GNOME.
     #[test]
-    fn gnome_wayland_uses_a_usable_x11() {
+    fn wayland_uses_a_usable_x11() {
         assert_eq!(prefer(GNOME_WAYLAND, true), (true, Some(":0".into())));
+        let kde = [("XDG_CURRENT_DESKTOP", "KDE"), ("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":0")];
+        assert_eq!(prefer(&kde, true), (true, Some(":0".into())));
         let screen = [("XDG_CURRENT_DESKTOP", "GNOME"), ("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":1.0")];
         assert_eq!(prefer(&screen, true), (true, Some(":1.0".into())));
         let zero = [GNOME_WAYLAND, &[("GRIDCRAFT_WAYLAND", "0")]].concat();
@@ -490,8 +514,6 @@ mod backend_tests {
     /// Everything else keeps winit's default backend, without even probing the X server.
     #[test]
     fn other_sessions_keep_the_default_backend() {
-        let kde = [("XDG_CURRENT_DESKTOP", "KDE"), ("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":0")];
-        assert_eq!(prefer(&kde, true), (false, None));
         let x11_session = [("XDG_CURRENT_DESKTOP", "GNOME"), ("DISPLAY", ":0")];
         assert_eq!(prefer(&x11_session, true), (false, None), "an X11 session already uses X11");
         let opt_out = [GNOME_WAYLAND, &[("GRIDCRAFT_WAYLAND", "1")]].concat();
